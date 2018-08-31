@@ -1,9 +1,9 @@
 /* global $, __filename */
 
 import {
-    SESSION_INITIATE_RECEIVED,
-    TRANSPORT_REPLACE_START,
-    TRANSPORT_REPLACE_SUCCESS
+    ACTION_JINGLE_TR_RECEIVED,
+    ACTION_JINGLE_TR_SUCCESS,
+    createJingleEvent
 } from '../../service/statistics/AnalyticsEvents';
 import { getLogger } from 'jitsi-meet-logger';
 import { $iq, Strophe } from 'strophe.js';
@@ -41,12 +41,8 @@ class JingleConnectionPlugin extends ConnectionPlugin {
         this.jvbIceConfig = iceConfig.jvb;
         this.p2pIceConfig = iceConfig.p2p;
         this.mediaConstraints = {
-            mandatory: {
-                'OfferToReceiveAudio': true,
-                'OfferToReceiveVideo': true
-            }
-
-            // MozDontOfferDataChannel: true when this is firefox
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: true
         };
     }
 
@@ -128,6 +124,11 @@ class JingleConnectionPlugin extends ConnectionPlugin {
         }
         const now = window.performance.now();
 
+        // FIXME that should work most of the time, but we'd have to
+        // think how secure it is to assume that user with "focus"
+        // nickname is Jicofo.
+        const isP2P = Strophe.getResourceFromJid(fromJid) !== 'focus';
+
         // see http://xmpp.org/extensions/xep-0166.html#concepts-session
 
         switch (action) {
@@ -145,11 +146,6 @@ class JingleConnectionPlugin extends ConnectionPlugin {
                     videoMuted === 'true');
             }
 
-            // FIXME that should work most of the time, but we'd have to
-            // think how secure it is to assume that user with "focus"
-            // nickname is Jicofo.
-            const isP2P = Strophe.getResourceFromJid(fromJid) !== 'focus';
-
             logger.info(
                 `Marking session from ${fromJid
                 } as ${isP2P ? '' : '*not*'} P2P`);
@@ -162,15 +158,12 @@ class JingleConnectionPlugin extends ConnectionPlugin {
                     this.mediaConstraints,
                     isP2P ? this.p2pIceConfig : this.jvbIceConfig,
                     isP2P,
-                    /* initiator */ false,
-                    this.xmpp.options);
+                    /* initiator */ false);
 
             this.sessions[sess.sid] = sess;
 
             this.eventEmitter.emit(XMPPEvents.CALL_INCOMING,
                 sess, $(iq).find('>jingle'), now);
-            Statistics.analytics.sendEvent(
-                SESSION_INITIATE_RECEIVED, { value: now });
             break;
         }
         case 'session-accept': {
@@ -204,17 +197,23 @@ class JingleConnectionPlugin extends ConnectionPlugin {
         }
         case 'transport-replace':
             logger.info('(TIME) Start transport replace', now);
-            Statistics.analytics.sendEvent(
-                TRANSPORT_REPLACE_START,
-                { value: now });
+            Statistics.sendAnalytics(createJingleEvent(
+                ACTION_JINGLE_TR_RECEIVED,
+                {
+                    p2p: isP2P,
+                    value: now
+                }));
 
             sess.replaceTransport($(iq).find('>jingle'), () => {
                 const successTime = window.performance.now();
 
                 logger.info('(TIME) Transport replace success!', successTime);
-                Statistics.analytics.sendEvent(
-                    TRANSPORT_REPLACE_SUCCESS,
-                    { value: successTime });
+                Statistics.sendAnalytics(createJingleEvent(
+                    ACTION_JINGLE_TR_SUCCESS,
+                    {
+                        p2p: isP2P,
+                        value: successTime
+                    }));
             }, error => {
                 GlobalOnErrorHandler.callErrorHandler(error);
                 logger.error('Transport replace failed', error);
@@ -260,8 +259,7 @@ class JingleConnectionPlugin extends ConnectionPlugin {
                 this.mediaConstraints,
                 this.p2pIceConfig,
                 /* P2P */ true,
-                /* initiator */ true,
-                this.xmpp.options);
+                /* initiator */ true);
 
         this.sessions[sess.sid] = sess;
 
@@ -291,8 +289,7 @@ class JingleConnectionPlugin extends ConnectionPlugin {
         // uses time-limited credentials as described in
         // http://tools.ietf.org/html/draft-uberti-behave-turn-rest-00
         //
-        // See https://code.google.com/p/prosody-modules/source/browse/
-        // mod_turncredentials/mod_turncredentials.lua
+        // See https://modules.prosody.im/mod_turncredentials.html
         // for a prosody module which implements this.
         //
         // Currently, this doesn't work with updateIce and therefore credentials
@@ -303,8 +300,7 @@ class JingleConnectionPlugin extends ConnectionPlugin {
         this.connection.sendIQ(
             $iq({ type: 'get',
                 to: this.connection.domain })
-                .c('services', { xmlns: 'urn:xmpp:extdisco:1' })
-                .c('service', { host: `turn.${this.connection.domain}` }),
+                .c('services', { xmlns: 'urn:xmpp:extdisco:1' }),
             res => {
                 const iceservers = [];
 
@@ -345,7 +341,7 @@ class JingleConnectionPlugin extends ConnectionPlugin {
                         dict.url += el.attr('host');
                         const port = el.attr('port');
 
-                        if (port && port !== '3478') {
+                        if (port) {
                             dict.url += `:${el.attr('port')}`;
                         }
                         const transport = el.attr('transport');
@@ -365,7 +361,10 @@ class JingleConnectionPlugin extends ConnectionPlugin {
                 const options = this.xmpp.options;
 
                 if (options.useStunTurn) {
-                    this.jvbIceConfig.iceServers = iceservers;
+                    // we want to filter and leave only tcp/turns candidates
+                    // which make sense for the jvb connections
+                    this.jvbIceConfig.iceServers
+                        = iceservers.filter(s => s.url.startsWith('turns'));
                 }
 
                 if (options.p2p && options.p2p.useStunTurn) {

@@ -9,8 +9,9 @@ import JitsiLocalTrack from './JitsiLocalTrack';
 import JitsiTrackError from '../../JitsiTrackError';
 import * as JitsiTrackErrors from '../../JitsiTrackErrors';
 import Listenable from '../util/Listenable';
+import { safeCounterIncrement } from '../util/MathUtil';
 import * as MediaType from '../../service/RTC/MediaType';
-import RTCBrowserType from './RTCBrowserType';
+import browser from '../browser';
 import RTCEvents from '../../service/RTC/RTCEvents';
 import RTCUtils from './RTCUtils';
 import Statistics from '../statistics/statistics';
@@ -19,6 +20,17 @@ import VideoType from '../../service/RTC/VideoType';
 
 const logger = getLogger(__filename);
 
+/**
+ * The counter used to generated id numbers assigned to peer connections
+ * @type {number}
+ */
+let peerConnectionIdCounter = 0;
+
+/**
+ * The counter used to generate id number for the local
+ * <code>MediaStreamTrack</code>s.
+ * @type {number}
+ */
 let rtcTrackIdCounter = 0;
 
 /**
@@ -36,7 +48,7 @@ function createLocalTracks(tracksInfo, options) {
         } else if (trackInfo.videoType === VideoType.CAMERA) {
             deviceId = options.cameraDeviceId;
         }
-        rtcTrackIdCounter += 1;
+        rtcTrackIdCounter = safeCounterIncrement(rtcTrackIdCounter);
         const localTrack = new JitsiLocalTrack({
             ...trackInfo,
             deviceId,
@@ -79,7 +91,7 @@ function _newCreateLocalTracks(mediaStreamMetaData = []) {
         // FIXME Move rtcTrackIdCounter to a static method in JitsiLocalTrack
         // so RTC does not need to handle ID management. This move would be
         // safer to do once the old createLocalTracks is removed.
-        rtcTrackIdCounter += 1;
+        rtcTrackIdCounter = safeCounterIncrement(rtcTrackIdCounter);
 
         return new JitsiLocalTrack({
             deviceId,
@@ -113,12 +125,6 @@ export default class RTC extends Listenable {
          * @type {Map.<number, TraceablePeerConnection>}
          */
         this.peerConnections = new Map();
-
-        /**
-         * The counter used to generated id numbers assigned to peer connections
-         * @type {number}
-         */
-        this.peerConnectionIdCounter = 1;
 
         this.localTracks = [];
 
@@ -156,6 +162,15 @@ export default class RTC extends Listenable {
         this._lastNEndpoints = null;
 
         /**
+         * The number representing the maximum video height the local client
+         * should receive from the bridge.
+         *
+         * @type {number|undefined}
+         * @private
+         */
+        this._maxFrameHeight = undefined;
+
+        /**
          * The endpoint ID of currently pinned participant or <tt>null</tt> if
          * no user is pinned.
          * @type {string|null}
@@ -164,12 +179,12 @@ export default class RTC extends Listenable {
         this._pinnedEndpoint = null;
 
         /**
-         * The endpoint ID of currently selected participant or <tt>null</tt> if
-         * no user is selected.
-         * @type {string|null}
+         * The endpoint IDs of currently selected participants.
+         *
+         * @type {Array}
          * @private
          */
-        this._selectedEndpoint = null;
+        this._selectedEndpoints = [];
 
         // The last N change listener.
         this._lastNChangeListener = this._onLastNChanged.bind(this);
@@ -192,16 +207,12 @@ export default class RTC extends Listenable {
      * @param {object} [options] Optional parameters.
      * @param {array} options.devices The devices that will be requested.
      * @param {string} options.resolution Resolution constraints.
-     * @param {bool} options.dontCreateJitsiTrack If <tt>true</tt> objects with
-     *     the following structure {stream: the Media Stream, type: "audio" or
-     *     "video", videoType: "camera" or "desktop"} will be returned trough
-     *     the Promise, otherwise JitsiTrack objects will be returned.
      * @param {string} options.cameraDeviceId
      * @param {string} options.micDeviceId
      * @returns {*} Promise object that will receive the new JitsiTracks
      */
     static obtainAudioAndVideoPermissions(options) {
-        const usesNewGumFlow = RTCBrowserType.usesNewGumFlow();
+        const usesNewGumFlow = browser.usesNewGumFlow();
         const obtainMediaPromise = usesNewGumFlow
             ? RTCUtils.newObtainAudioAndVideoPermissions(options)
             : RTCUtils.obtainAudioAndVideoPermissions(options);
@@ -243,13 +254,19 @@ export default class RTC extends Listenable {
             try {
                 this._channel.sendPinnedEndpointMessage(
                     this._pinnedEndpoint);
-                this._channel.sendSelectedEndpointMessage(
-                    this._selectedEndpoint);
+                this._channel.sendSelectedEndpointsMessage(
+                    this._selectedEndpoints);
+
+                if (typeof this._maxFrameHeight !== 'undefined') {
+                    this._channel.sendReceiverVideoConstraintMessage(
+                        this._maxFrameHeight);
+                }
             } catch (error) {
                 GlobalOnErrorHandler.callErrorHandler(error);
                 logger.error(
                     `Cannot send selected(${this._selectedEndpoint})`
-                    + `pinned(${this._pinnedEndpoint}) endpoint message.`,
+                    + `pinned(${this._pinnedEndpoint})`
+                    + `frameHeight(${this._maxFrameHeight}) endpoint message`,
                     error);
             }
 
@@ -321,33 +338,37 @@ export default class RTC extends Listenable {
 
     /**
      * Sets the maximum video size the local participant should receive from
-     * remote participants. Will no-op if no data channel has been established.
+     * remote participants. Will cache the value and send it through the channel
+     * once it is created.
      *
      * @param {number} maxFrameHeightPixels the maximum frame height, in pixels,
      * this receiver is willing to receive.
      * @returns {void}
      */
     setReceiverVideoConstraint(maxFrameHeight) {
-        if (this._channel) {
+        this._maxFrameHeight = maxFrameHeight;
+
+        if (this._channel && this._channelOpen) {
             this._channel.sendReceiverVideoConstraintMessage(maxFrameHeight);
         }
     }
 
     /**
-     * Elects the participant with the given id to be the selected participant
-     * in order to always receive video for this participant (even when last n
-     * is enabled).
-     * If there is no channel we store it and send it through the channel once
-     * it is created.
-     * @param {string} id The user id.
+     * Elects the participants with the given ids to be the selected
+     * participants in order to always receive video for this participant (even
+     * when last n is enabled). If there is no channel we store it and send it
+     * through the channel once it is created.
+     *
+     * @param {Array<string>} ids - The user ids.
      * @throws NetworkError or InvalidStateError or Error if the operation
      * fails.
+     * @returns {void}
      */
-    selectEndpoint(id) {
-        // Cache the value if channel is missing, till we open it.
-        this._selectedEndpoint = id;
+    selectEndpoints(ids) {
+        this._selectedEndpoints = ids;
+
         if (this._channel && this._channelOpen) {
-            this._channel.sendSelectedEndpointMessage(id);
+            this._channel.sendSelectedEndpointsMessage(ids);
         }
     }
 
@@ -383,13 +404,6 @@ export default class RTC extends Listenable {
      */
     static removeListener(eventType, listener) {
         RTCUtils.removeListener(eventType, listener);
-    }
-
-    /**
-     *
-     */
-    static isRTCReady() {
-        return RTCUtils.isRTCReady();
     }
 
     /**
@@ -441,16 +455,16 @@ export default class RTC extends Listenable {
                 { abtestSuspendVideo: options.abtestSuspendVideo });
         }
 
+        peerConnectionIdCounter = safeCounterIncrement(peerConnectionIdCounter);
         const newConnection
             = new TraceablePeerConnection(
                 this,
-                this.peerConnectionIdCounter,
+                peerConnectionIdCounter,
                 signaling,
                 iceConfig, pcConstraints,
                 isP2P, options);
 
         this.peerConnections.set(newConnection.id, newConnection);
-        this.peerConnectionIdCounter += 1;
 
         return newConnection;
     }
@@ -671,6 +685,18 @@ export default class RTC extends Listenable {
      */
     static isDeviceChangeAvailable(deviceType) {
         return RTCUtils.isDeviceChangeAvailable(deviceType);
+    }
+
+    /**
+     * Returns whether the current execution environment supports WebRTC (for
+     * use within this library).
+     *
+     * @returns {boolean} {@code true} if WebRTC is supported in the current
+     * execution environment (for use within this library); {@code false},
+     * otherwise.
+     */
+    static isWebRtcSupported() {
+        return browser.isSupported();
     }
 
     /**

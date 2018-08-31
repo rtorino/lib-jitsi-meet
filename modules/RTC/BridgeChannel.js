@@ -152,20 +152,21 @@ export default class BridgeChannel {
     }
 
     /**
-     * Sends a "selected endpoint changed" message via the channel.
-     * @param {string} endpointId The id of the selected endpoint.
+     * Sends a "selected endpoints changed" message via the channel.
+     *
+     * @param {Array<string>} endpointIds - The ids of the selected endpoints.
      * @throws NetworkError or InvalidStateError from RTCDataChannel#send (@see
      * {@link https://developer.mozilla.org/docs/Web/API/RTCDataChannel/send})
      * or from WebSocket#send or Error with "No opened channel" message.
      */
-    sendSelectedEndpointMessage(endpointId) {
+    sendSelectedEndpointsMessage(endpointIds) {
         logger.log(
-            'sending selected changed notification to the bridge for endpoint ',
-            endpointId);
+            'sending selected changed notification to the bridge for endpoints',
+            endpointIds);
 
         this._send({
-            colibriClass: 'SelectedEndpointChangedEvent',
-            selectedEndpoint: endpointId || null
+            colibriClass: 'SelectedEndpointsChangedEvent',
+            selectedEndpoints: endpointIds
         });
     }
 
@@ -263,6 +264,13 @@ export default class BridgeChannel {
                 emitter.emit(RTCEvents.LASTN_ENDPOINT_CHANGED,
                     lastNEndpoints, obj);
 
+                break;
+            }
+            case 'SelectedUpdateEvent': {
+                const isSelected = obj.isSelected;
+
+                logger.info(`SelectedUpdateEvent isSelected? ${isSelected}`);
+                emitter.emit(RTCEvents.IS_SELECTED_CHANGED, isSelected);
                 break;
             }
             default: {

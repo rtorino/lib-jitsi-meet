@@ -9,7 +9,7 @@ const AuthenticationEvents
     = require('../../service/authentication/AuthenticationEvents');
 const GlobalOnErrorHandler = require('../util/GlobalOnErrorHandler');
 
-import RTCBrowserType from '../RTC/RTCBrowserType';
+import browser from '../browser';
 import Settings from '../settings/Settings';
 
 /**
@@ -147,6 +147,7 @@ Moderator.prototype.createConferenceIq = function() {
     // Session Id used for authentication
     const { sessionId } = Settings;
     const machineUID = Settings.machineId;
+    const config = this.options.conference;
 
     logger.info(`Session ID: ${sessionId} machine UID: ${machineUID}`);
 
@@ -176,43 +177,76 @@ Moderator.prototype.createConferenceIq = function() {
                 value: this.options.connection.hosts.call_control
             }).up();
     }
-    if (this.options.conference.channelLastN !== undefined) {
+    if (config.channelLastN !== undefined) {
         elem.c(
             'property', {
                 name: 'channelLastN',
-                value: this.options.conference.channelLastN
+                value: config.channelLastN
             }).up();
     }
     elem.c(
         'property', {
             name: 'disableRtx',
-            value: Boolean(this.options.conference.disableRtx)
+            value: Boolean(config.disableRtx)
         }).up();
+
+    if (config.enableTcc !== undefined) {
+        elem.c(
+                'property', {
+                    name: 'enableTcc',
+                    value: Boolean(config.enableTcc)
+                }).up();
+    }
+    if (config.enableRemb !== undefined) {
+        elem.c(
+                'property', {
+                    name: 'enableRemb',
+                    value: Boolean(config.enableRemb)
+                }).up();
+    }
+    if (config.minParticipants !== undefined) {
+        elem.c(
+                'property', {
+                    name: 'minParticipants',
+                    value: config.minParticipants
+                }).up();
+    }
+
     elem.c(
         'property', {
             name: 'enableLipSync',
             value: this.options.connection.enableLipSync !== false
         }).up();
-    if (this.options.conference.audioPacketDelay !== undefined) {
+    if (config.audioPacketDelay !== undefined) {
         elem.c(
             'property', {
                 name: 'audioPacketDelay',
-                value: this.options.conference.audioPacketDelay
+                value: config.audioPacketDelay
             }).up();
     }
-    if (this.options.conference.startBitrate) {
+    if (config.startBitrate) {
         elem.c(
             'property', {
                 name: 'startBitrate',
-                value: this.options.conference.startBitrate
+                value: config.startBitrate
             }).up();
     }
-    if (this.options.conference.minBitrate) {
+    if (config.minBitrate) {
         elem.c(
             'property', {
                 name: 'minBitrate',
-                value: this.options.conference.minBitrate
+                value: config.minBitrate
             }).up();
+    }
+    if (config.testing && config.testing.octo
+        && typeof config.testing.octo.probability === 'number') {
+        if (Math.random() < config.testing.octo.probability) {
+            elem.c(
+                'property', {
+                    name: 'octo',
+                    value: true
+                }).up();
+        }
     }
 
     let openSctp;
@@ -228,7 +262,7 @@ Moderator.prototype.createConferenceIq = function() {
         break;
     }
 
-    if (openSctp && !RTCBrowserType.supportsDataChannels()) {
+    if (openSctp && !browser.supportsDataChannels()) {
         openSctp = false;
     }
 

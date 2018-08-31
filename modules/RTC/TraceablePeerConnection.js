@@ -9,7 +9,7 @@ import * as MediaType from '../../service/RTC/MediaType';
 import LocalSdpMunger from './LocalSdpMunger';
 import RTC from './RTC';
 import RTCUtils from './RTCUtils';
-import RTCBrowserType from './RTCBrowserType';
+import browser from '../browser';
 import RTCEvents from '../../service/RTC/RTCEvents';
 import RtxModifier from '../xmpp/RtxModifier';
 
@@ -49,6 +49,9 @@ const SIM_LAYER_RIDS = [ SIM_LAYER_1_RID, SIM_LAYER_2_RID, SIM_LAYER_3_RID ];
  *      disabled by removing it from the SDP.
  * @param {boolean} options.preferH264 if set to 'true' H264 will be preferred
  * over other video codecs.
+ * @param {boolean} options.enableLayerSuspension if set to 'true', we will
+ * cap the video send bitrate when we are told we have not been selected by
+ * any endpoints (and therefore the non-thumbnail streams are not in use).
  *
  * FIXME: initially the purpose of TraceablePeerConnection was to be able to
  * debug the peer connection. Since many other responsibilities have been added
@@ -123,8 +126,7 @@ export default function TraceablePeerConnection(
 
     /**
      * Keeps tracks of the WebRTC <tt>MediaStream</tt>s that have been added to
-     * the underlying WebRTC PeerConnection. An Array is used to avoid errors in
-     * IE11 with adding temasys MediaStream objects into other data structures.
+     * the underlying WebRTC PeerConnection.
      * @type {Array}
      * @private
      */
@@ -185,13 +187,14 @@ export default function TraceablePeerConnection(
     this.statsinterval = null;
 
     /**
-     * @type {number}
+     * @type {number} The max number of stats to keep in this.stats. Limit to
+     * 300 values, i.e. 5 minutes; set to 0 to disable
      */
-    this.maxstats = 0;
-    const Interop = require('sdp-interop').Interop;
+    this.maxstats = options.maxstats;
+    const Interop = require('@jitsi/sdp-interop').Interop;
 
     this.interop = new Interop();
-    const Simulcast = require('sdp-simulcast');
+    const Simulcast = require('@jitsi/sdp-simulcast');
 
     this.simulcast = new Simulcast({ numOfLayers: SIMULCAST_LAYERS,
         explodeRemoteSimulcast: false });
@@ -213,15 +216,8 @@ export default function TraceablePeerConnection(
 
     // override as desired
     this.trace = (what, info) => {
-        /* logger.warn('WTRACE', what, info);
-        if (info && RTCBrowserType.isIExplorer()) {
-            if (info.length > 1024) {
-                logger.warn('WTRACE', what, info.substr(1024));
-            }
-            if (info.length > 2048) {
-                logger.warn('WTRACE', what, info.substr(2048));
-            }
-        }*/
+        logger.debug(what, info);
+
         this.updateLog.push({
             time: new Date(),
             type: what,
@@ -230,12 +226,9 @@ export default function TraceablePeerConnection(
     };
     this.onicecandidate = null;
     this.peerconnection.onicecandidate = event => {
-        // FIXME: this causes stack overflow with Temasys Plugin
-        if (!RTCBrowserType.isTemasysPluginUsed()) {
-            this.trace(
-                'onicecandidate',
-                JSON.stringify(event.candidate, null, ' '));
-        }
+        this.trace(
+            'onicecandidate',
+            JSON.stringify(event.candidate, null, ' '));
 
         if (this.onicecandidate !== null) {
             this.onicecandidate(event);
@@ -268,42 +261,32 @@ export default function TraceablePeerConnection(
     };
     this.ondatachannel = null;
     this.peerconnection.ondatachannel = event => {
-        this.trace('ondatachannel', event);
+        this.trace('ondatachannel');
         if (this.ondatachannel !== null) {
             this.ondatachannel(event);
         }
     };
 
-    // XXX: do all non-firefox browsers which we support also support this?
-    if (!RTCBrowserType.isFirefox() && this.maxstats) {
+    if (this.maxstats) {
         this.statsinterval = window.setInterval(() => {
-            this.peerconnection.getStats(stats => {
-                const results = stats.result();
-                const now = new Date();
+            this.getStats(stats => {
+                if (stats.result
+                    && typeof stats.result === 'function') {
+                    const results = stats.result();
 
-                for (let i = 0; i < results.length; ++i) {
-                    results[i].names().forEach(name => {
-                        // eslint-disable-next-line no-shadow
-                        const id = `${results[i].id}-${name}`;
-                        let s = this.stats[id];
+                    for (let i = 0; i < results.length; ++i) {
+                        const res = results[i];
 
-                        if (!s) {
-                            this.stats[id] = s = {
-                                startTime: now,
-                                endTime: now,
-                                values: [],
-                                times: []
-                            };
-                        }
-                        s.values.push(results[i].stat(name));
-                        s.times.push(now.getTime());
-                        if (s.values.length > this.maxstats) {
-                            s.values.shift();
-                            s.times.shift();
-                        }
-                        s.endTime = now;
-                    });
+                        res.names().forEach(name => {
+                            this._processStat(res, name, res.stat(name));
+                        });
+                    }
+                } else {
+                    stats.forEach(r => this._processStat(r, '', r));
                 }
+            }, () => {
+
+                // empty error callback
             });
         }, 1000);
     }
@@ -312,6 +295,36 @@ export default function TraceablePeerConnection(
 }
 
 /* eslint-enable max-params */
+
+/**
+ * Process stat and adds it to the array of stats we store.
+ * @param report the current stats report.
+ * @param name the name of the report, if available
+ * @param statValue the value to add.
+ * @private
+ */
+TraceablePeerConnection.prototype._processStat
+    = function(report, name, statValue) {
+        const id = `${report.id}-${name}`;
+        let s = this.stats[id];
+        const now = new Date();
+
+        if (!s) {
+            this.stats[id] = s = {
+                startTime: now,
+                endTime: now,
+                values: [],
+                times: []
+            };
+        }
+        s.values.push(statValue);
+        s.times.push(now.getTime());
+        if (s.values.length > this.maxstats) {
+            s.values.shift();
+            s.times.shift();
+        }
+        s.endTime = now;
+    };
 
 /**
  * Returns a string representation of a SessionDescription object.
@@ -376,14 +389,14 @@ TraceablePeerConnection.prototype._getDesiredMediaDirection = function(
  */
 TraceablePeerConnection.prototype.isSimulcastOn = function() {
     return !this.options.disableSimulcast
-        && RTCBrowserType.supportsSimulcast()
+        && browser.supportsSimulcast()
 
         // Firefox has been added as supporting simulcast, but it is
         // experimental so we only want to do it for firefox if the config
-        // option is set.  Unfortunately, RTCBrowserType::supportsSimulcast()
+        // option is set.  Unfortunately, browser::supportsSimulcast()
         // doesn't have a reference to the config options, so we have
         // to do it here
-        && (!RTCBrowserType.isFirefox()
+        && (!browser.isFirefox()
             || this.options.enableFirefoxSimulcast);
 };
 
@@ -529,6 +542,30 @@ TraceablePeerConnection.prototype.getTrackBySSRC = function(ssrc) {
 };
 
 /**
+ * Tries to find SSRC number for given {@link JitsiTrack} id. It will search
+ * both local and remote tracks bound to this instance.
+ * @param {string} id
+ * @return {number|null}
+ */
+TraceablePeerConnection.prototype.getSsrcByTrackId = function(id) {
+
+    const findTrackById = track => track.getTrack().id === id;
+    const localTrack = this.getLocalTracks().find(findTrackById);
+
+    if (localTrack) {
+        return this.getLocalSSRC(localTrack);
+    }
+
+    const remoteTrack = this.getRemoteTracks().find(findTrackById);
+
+    if (remoteTrack) {
+        return remoteTrack.getSSRC();
+    }
+
+    return null;
+};
+
+/**
  * Called when new remote MediaStream is added to the PeerConnection.
  * @param {MediaStream} stream the WebRTC MediaStream for remote participant
  */
@@ -544,8 +581,8 @@ TraceablePeerConnection.prototype._remoteStreamAdded = function(stream) {
     }
 
     // Bind 'addtrack'/'removetrack' event handlers
-    if (RTCBrowserType.isChrome() || RTCBrowserType.isNWJS()
-        || RTCBrowserType.isElectron() || RTCBrowserType.isEdge()) {
+    if (browser.isChrome() || browser.isNWJS()
+        || browser.isElectron() || browser.isEdge()) {
         stream.onaddtrack = event => {
             this._remoteTrackAdded(stream, event.track);
         };
@@ -611,14 +648,8 @@ TraceablePeerConnection.prototype._remoteTrackAdded = function(stream, track) {
 
     let ssrcLines = SDPUtil.findLines(mediaLines[0], 'a=ssrc:');
 
-    ssrcLines = ssrcLines.filter(
-        line => {
-            const msid
-                = RTCBrowserType.isTemasysPluginUsed() ? 'mslabel' : 'msid';
-
-
-            return line.indexOf(`${msid}:${streamId}`) !== -1;
-        });
+    ssrcLines
+        = ssrcLines.filter(line => line.indexOf(`msid:${streamId}`) !== -1);
     if (!ssrcLines.length) {
         GlobalOnErrorHandler.callErrorHandler(
             new Error(
@@ -1182,7 +1213,7 @@ const getters = {
         this.trace('getLocalDescription::preTransform', dumpSDP(desc));
 
         // if we're running on FF, transform to Plan B first.
-        if (RTCBrowserType.usesUnifiedPlan()) {
+        if (browser.usesUnifiedPlan()) {
             desc = this.interop.toPlanB(desc);
             this.trace('getLocalDescription::postTransform (Plan B)',
                 dumpSDP(desc));
@@ -1192,7 +1223,7 @@ const getters = {
                 dumpSDP(desc));
         }
 
-        if (RTCBrowserType.doesVideoMuteByStreamRemove()) {
+        if (browser.doesVideoMuteByStreamRemove()) {
             desc = this.localSdpMunger.maybeAddMutedLocalVideoTracksToSDP(desc);
             logger.debug(
                 'getLocalDescription::postTransform (munge local SDP)', desc);
@@ -1208,6 +1239,9 @@ const getters = {
         // happening (check setLocalDescription impl).
         desc = enforceSendRecv(desc);
 
+        // See the method's doc for more info about this transformation.
+        desc = this.localSdpMunger.transformStreamIdentifiers(desc);
+
         return desc;
     },
     remoteDescription() {
@@ -1216,7 +1250,7 @@ const getters = {
         this.trace('getRemoteDescription::preTransform', dumpSDP(desc));
 
         // if we're running on FF, transform to Plan B first.
-        if (RTCBrowserType.usesUnifiedPlan()) {
+        if (browser.usesUnifiedPlan()) {
             desc = this.interop.toPlanB(desc);
             this.trace(
                 'getRemoteDescription::postTransform (Plan B)', dumpSDP(desc));
@@ -1262,14 +1296,14 @@ TraceablePeerConnection.prototype.addTrack = function(track) {
         this._addStream(webrtcStream);
 
     // It's not ok for a track to not have a WebRTC stream if:
-    } else if (!RTCBrowserType.doesVideoMuteByStreamRemove()
+    } else if (!browser.doesVideoMuteByStreamRemove()
                 || track.isAudioTrack()
                 || (track.isVideoTrack() && !track.isMuted())) {
         logger.error(`${this} no WebRTC stream for: ${track}`);
     }
 
     // Muted video tracks do not have WebRTC stream
-    if (RTCBrowserType.doesVideoMuteByStreamRemove()
+    if (browser.doesVideoMuteByStreamRemove()
             && track.isVideoTrack() && track.isMuted()) {
         const ssrcInfo = this.generateNewStreamSSRCInfo(track);
 
@@ -1340,7 +1374,7 @@ TraceablePeerConnection.prototype._addStream = function(mediaStream) {
  * @param {MediaStream} mediaStream
  */
 TraceablePeerConnection.prototype._removeStream = function(mediaStream) {
-    if (RTCBrowserType.isFirefox()) {
+    if (browser.isFirefox()) {
         this._handleFirefoxRemoveStream(mediaStream);
     } else {
         this.peerconnection.removeStream(mediaStream);
@@ -1405,12 +1439,99 @@ TraceablePeerConnection.prototype.removeTrack = function(localTrack) {
     this.localSSRCs.delete(localTrack.rtcId);
 
     if (webRtcStream) {
-        if (RTCBrowserType.isFirefox()) {
+        if (browser.isFirefox()) {
             this._handleFirefoxRemoveStream(webRtcStream);
         } else {
             this.peerconnection.removeStream(webRtcStream);
         }
     }
+};
+
+/**
+ * Returns the sender corresponding to the given MediaStream.
+ *
+ * @param {MediaStream} stream - The media stream used for the search.
+ * @returns {RTPSender|undefined} - The found sender or undefined if no sender
+ * was found.
+ */
+TraceablePeerConnection.prototype.findSenderByStream = function(stream) {
+    const track = stream.getTracks()[0];
+
+    if (!track) {
+        logger.error('Cannot find sender: no tracks.');
+
+        return;
+    }
+
+    // Find the right sender (for audio or video)
+    return this.peerconnection.getSenders().find(s => s.track === track);
+};
+
+/**
+ * Replaces <tt>oldTrack</tt> with <tt>newTrack</tt> from the peer connection.
+ * Either <tt>oldTrack</tt> or <tt>newTrack</tt> can be null; replacing a valid
+ * <tt>oldTrack</tt> with a null <tt>newTrack</tt> effectively just removes
+ * <tt>oldTrack</tt>
+ *
+ * @param {JitsiLocalTrack|null} oldTrack - The current track in use to be
+ * replaced
+ * @param {JitsiLocalTrack|null} newTrack - The new track to use
+ * @returns {Promise<boolean>} - If the promise resolves with true,
+ * renegotiation will be needed. Otherwise no renegotiation is needed.
+ */
+TraceablePeerConnection.prototype.replaceTrack = function(oldTrack, newTrack) {
+    if (browser.isFirefox() && oldTrack && newTrack) {
+        // Add and than remove stream in FF leads to wrong local SDP. In order
+        // to workaround the issue we need to use sender.replaceTrack().
+        const sender = this.findSenderByStream(oldTrack.getOriginalStream());
+        const stream = newTrack.getOriginalStream();
+
+        if (sender && stream) {
+            const track = stream.getTracks()[0];
+
+            if (track) {
+                return sender.replaceTrack(track, stream).then(() => {
+                    // Since there is no need to do renegotiations we need to
+                    // fix all ssrc-msid mappings here.
+                    // NOTE: after sender.replaceTrack the sdp will remain the
+                    // same but the stream attach to the new JitsiLocalTrack
+                    // will have different msid. Luckily on FF we are not doing
+                    // all the transformations related to video mute.
+
+                    const ssrc = this.localSSRCs.get(oldTrack.rtcId);
+
+                    this.localTracks.delete(oldTrack.rtcId);
+                    this.localSSRCs.delete(oldTrack.rtcId);
+                    this._addedStreams
+                        = this._addedStreams.filter(s => s !== stream);
+
+                    this.localTracks.set(newTrack.rtcId, newTrack);
+
+                    // Override the msid of JitsiLocalTrack in order to be
+                    // consistent with the SDP values.
+                    newTrack.storedMSID = oldTrack.storedMSID;
+                    this._addedStreams.push(stream);
+
+                    this.localSSRCs.set(newTrack.rtcId, ssrc);
+                    this.eventEmitter.emit(
+                        RTCEvents.LOCAL_TRACK_SSRC_UPDATED,
+                        newTrack,
+                        extractPrimarySSRC(ssrc));
+
+                    return false;
+                });
+            }
+        }
+    }
+
+    if (oldTrack) {
+        this.removeTrack(oldTrack);
+    }
+    if (newTrack) {
+        this.addTrack(newTrack);
+    }
+
+    return Promise.resolve(true);
 };
 
 /**
@@ -1455,36 +1576,8 @@ TraceablePeerConnection.prototype._handleFirefoxRemoveStream = function(
         // There is nothing to be changed
         return;
     }
-    let sender = null;
 
-    // On Firefox we don't replace MediaStreams as this messes up the
-    // m-lines (which can't be removed in Plan Unified) and brings a lot
-    // of complications. Instead, we use the RTPSender and remove just
-    // the track.
-    let track = null;
-
-    if (stream.getAudioTracks() && stream.getAudioTracks().length) {
-        track = stream.getAudioTracks()[0];
-    } else if (stream.getVideoTracks() && stream.getVideoTracks().length) {
-        track = stream.getVideoTracks()[0];
-    }
-
-    if (!track) {
-        logger.error('Cannot remove tracks: no tracks.');
-
-        return;
-    }
-
-    // Find the right sender (for audio or video)
-    this.peerconnection.getSenders().some(s => {
-        if (s.track === track) {
-            sender = s;
-
-            return true;
-        }
-
-        return false;
-    });
+    const sender = this.findSenderByStream(stream);
 
     if (sender) {
         this.peerconnection.removeTrack(sender);
@@ -1593,10 +1686,7 @@ TraceablePeerConnection.prototype._adjustLocalMediaDirection = function(
     return localDescription;
 };
 
-TraceablePeerConnection.prototype.setLocalDescription = function(
-        description,
-        successCallback,
-        failureCallback) {
+TraceablePeerConnection.prototype.setLocalDescription = function(description) {
     let localSdp = description;
 
     this.trace('setLocalDescription::preTransform', dumpSDP(localSdp));
@@ -1625,33 +1715,33 @@ TraceablePeerConnection.prototype.setLocalDescription = function(
     localSdp = this._ensureSimulcastGroupIsLast(localSdp);
 
     // if we're using unified plan, transform to it first.
-    if (RTCBrowserType.usesUnifiedPlan()) {
+    if (browser.usesUnifiedPlan()) {
         localSdp = this.interop.toUnifiedPlan(localSdp);
         this.trace(
             'setLocalDescription::postTransform (Unified Plan)',
             dumpSDP(localSdp));
     }
 
-    this.peerconnection.setLocalDescription(localSdp,
-        () => {
-            this.trace('setLocalDescriptionOnSuccess');
-            const localUfrag = SDPUtil.getUfrag(localSdp.sdp);
+    return new Promise((resolve, reject) => {
+        this.peerconnection.setLocalDescription(localSdp)
+            .then(() => {
+                this.trace('setLocalDescriptionOnSuccess');
+                const localUfrag = SDPUtil.getUfrag(localSdp.sdp);
 
-            if (localUfrag !== this.localUfrag) {
-                this.localUfrag = localUfrag;
+                if (localUfrag !== this.localUfrag) {
+                    this.localUfrag = localUfrag;
+                    this.eventEmitter.emit(
+                        RTCEvents.LOCAL_UFRAG_CHANGED, this, localUfrag);
+                }
+                resolve();
+            }, err => {
+                this.trace('setLocalDescriptionOnFailure', err);
                 this.eventEmitter.emit(
-                    RTCEvents.LOCAL_UFRAG_CHANGED, this, localUfrag);
-            }
-            successCallback();
-        },
-        err => {
-            this.trace('setLocalDescriptionOnFailure', err);
-            this.eventEmitter.emit(
-                RTCEvents.SET_LOCAL_DESCRIPTION_FAILED,
-                err, this);
-            failureCallback(err);
-        }
-    );
+                    RTCEvents.SET_LOCAL_DESCRIPTION_FAILED,
+                    err, this);
+                reject(err);
+            });
+    });
 };
 
 /**
@@ -1717,10 +1807,7 @@ TraceablePeerConnection.prototype._insertUnifiedPlanSimulcastReceive
         });
     };
 
-TraceablePeerConnection.prototype.setRemoteDescription = function(
-        description,
-        successCallback,
-        failureCallback) {
+TraceablePeerConnection.prototype.setRemoteDescription = function(description) {
     this.trace('setRemoteDescription::preTransform', dumpSDP(description));
 
     // TODO the focus should squeze or explode the remote simulcast
@@ -1746,7 +1833,7 @@ TraceablePeerConnection.prototype.setRemoteDescription = function(
     }
 
     // If the browser uses unified plan, transform to it first
-    if (RTCBrowserType.usesUnifiedPlan()) {
+    if (browser.usesUnifiedPlan()) {
         // eslint-disable-next-line no-param-reassign
         description = new RTCSessionDescription({
             type: description.type,
@@ -1778,34 +1865,34 @@ TraceablePeerConnection.prototype.setRemoteDescription = function(
 
     // Safari WebRTC errors when no supported video codec is found in the offer.
     // To prevent the error, inject H264 into the video mLine.
-    if (RTCBrowserType.isSafariWithWebrtc()) {
+    if (browser.isSafariWithWebrtc()) {
         logger.debug('Maybe injecting H264 into the remote description');
 
         // eslint-disable-next-line no-param-reassign
         description = this._injectH264IfNotPresent(description);
     }
 
-    this.peerconnection.setRemoteDescription(
-        description,
-        () => {
-            this.trace('setRemoteDescriptionOnSuccess');
-            const remoteUfrag = SDPUtil.getUfrag(description.sdp);
+    return new Promise((resolve, reject) => {
+        this.peerconnection.setRemoteDescription(description)
+            .then(() => {
+                this.trace('setRemoteDescriptionOnSuccess');
+                const remoteUfrag = SDPUtil.getUfrag(description.sdp);
 
-            if (remoteUfrag !== this.remoteUfrag) {
-                this.remoteUfrag = remoteUfrag;
+                if (remoteUfrag !== this.remoteUfrag) {
+                    this.remoteUfrag = remoteUfrag;
+                    this.eventEmitter.emit(
+                        RTCEvents.REMOTE_UFRAG_CHANGED, this, remoteUfrag);
+                }
+                resolve();
+            }, err => {
+                this.trace('setRemoteDescriptionOnFailure', err);
                 this.eventEmitter.emit(
-                    RTCEvents.REMOTE_UFRAG_CHANGED, this, remoteUfrag);
-            }
-            successCallback();
-        },
-        err => {
-            this.trace('setRemoteDescriptionOnFailure', err);
-            this.eventEmitter.emit(
-                RTCEvents.SET_REMOTE_DESCRIPTION_FAILED,
-                err,
-                this);
-            failureCallback(err);
-        });
+                    RTCEvents.SET_REMOTE_DESCRIPTION_FAILED,
+                    err,
+                    this);
+                reject(err);
+            });
+    });
 };
 
 /**
@@ -2030,7 +2117,7 @@ TraceablePeerConnection.prototype.close = function() {
  * @private
  */
 const _fixAnswerRFC4145Setup = function(offer, answer) {
-    if (!RTCBrowserType.isChrome()) {
+    if (!browser.isChrome()) {
         // It looks like Firefox doesn't agree with the fix (at least in its
         // current implementation) because it effectively remains active even
         // after we tell it to become passive. Apart from Firefox which I tested
@@ -2077,11 +2164,8 @@ const _fixAnswerRFC4145Setup = function(offer, answer) {
     }
 };
 
-TraceablePeerConnection.prototype.createAnswer = function(
-        successCallback,
-        failureCallback,
-        constraints) {
-    if (RTCBrowserType.supportsRtpSender() && this.isSimulcastOn()) {
+TraceablePeerConnection.prototype.createAnswer = function(constraints) {
+    if (browser.supportsRtpSender() && this.isSimulcastOn()) {
         const videoSender
             = this.peerconnection.getSenders().find(sender =>
                 sender.track.kind === 'video');
@@ -2103,36 +2187,28 @@ TraceablePeerConnection.prototype.createAnswer = function(
 
         videoSender.setParameters(simParams);
     }
-    this._createOfferOrAnswer(
-        false /* answer */, successCallback, failureCallback, constraints);
+
+    return this._createOfferOrAnswer(false /* answer */, constraints);
 };
 
-TraceablePeerConnection.prototype.createOffer = function(
-        successCallback,
-        failureCallback,
-        constraints) {
-    this._createOfferOrAnswer(
-        true /* offer */, successCallback, failureCallback, constraints);
+TraceablePeerConnection.prototype.createOffer = function(constraints) {
+    return this._createOfferOrAnswer(true /* offer */, constraints);
 };
-
-/* eslint-disable max-params */
 
 TraceablePeerConnection.prototype._createOfferOrAnswer = function(
         isOffer,
-        successCallback,
-        failureCallback,
         constraints) {
     const logName = isOffer ? 'Offer' : 'Answer';
 
     this.trace(`create${logName}`, JSON.stringify(constraints, null, ' '));
 
-    const _successCallback = resultSdp => {
+    const handleSuccess = (resultSdp, resolveFn, rejectFn) => {
         try {
             this.trace(
                 `create${logName}OnSuccess::preTransform`, dumpSDP(resultSdp));
 
             // if we're using unified plan, transform to Plan B.
-            if (RTCBrowserType.usesUnifiedPlan()) {
+            if (browser.usesUnifiedPlan()) {
                 // eslint-disable-next-line no-param-reassign
                 resultSdp = this.interop.toPlanB(resultSdp);
                 this.trace(
@@ -2156,7 +2232,7 @@ TraceablePeerConnection.prototype._createOfferOrAnswer = function(
              *  after that, when we try and go back to unified plan it will
              *  complain about unmapped ssrcs)
              */
-            if (!RTCBrowserType.isFirefox()) {
+            if (!browser.isFirefox()) {
                 // If there are no local video tracks, then a "recvonly"
                 // SSRC needs to be generated
                 if (!this.hasAnyTracksOfType(MediaType.VIDEO)
@@ -2179,7 +2255,6 @@ TraceablePeerConnection.prototype._createOfferOrAnswer = function(
 
             // Add simulcast streams if simulcast is enabled
             if (this.isSimulcastOn()) {
-
                 // eslint-disable-next-line no-param-reassign
                 resultSdp = this.simulcast.mungeLocalDescription(resultSdp);
                 this.trace(
@@ -2188,7 +2263,7 @@ TraceablePeerConnection.prototype._createOfferOrAnswer = function(
                     dumpSDP(resultSdp));
             }
 
-            if (!this.options.disableRtx && RTCBrowserType.supportsRtx()) {
+            if (!this.options.disableRtx && browser.supportsRtx()) {
                 // eslint-disable-next-line no-param-reassign
                 resultSdp = new RTCSessionDescription({
                     type: resultSdp.type,
@@ -2222,16 +2297,17 @@ TraceablePeerConnection.prototype._createOfferOrAnswer = function(
             logger.debug('Got local SSRCs MAP: ', ssrcMap);
             this._processLocalSSRCsMap(ssrcMap);
 
-            successCallback(resultSdp);
+            resolveFn(resultSdp);
         } catch (e) {
             this.trace(`create${logName}OnError`, e);
             this.trace(`create${logName}OnError`, dumpSDP(resultSdp));
             logger.error(`create${logName}OnError`, e, dumpSDP(resultSdp));
-            failureCallback(e);
+
+            rejectFn(e);
         }
     };
 
-    const _errorCallback = err => {
+    const handleFailure = (err, rejectFn) => {
         this.trace(`create${logName}OnFailure`, err);
         const eventType
             = isOffer
@@ -2239,20 +2315,25 @@ TraceablePeerConnection.prototype._createOfferOrAnswer = function(
                 : RTCEvents.CREATE_ANSWER_FAILED;
 
         this.eventEmitter.emit(eventType, err, this);
-        failureCallback(err);
+
+        rejectFn(err);
     };
 
-    // NOTE Temasys plugin does not support "bind" on peerconnection methods
-    if (isOffer) {
-        this.peerconnection.createOffer(
-            _successCallback, _errorCallback, constraints);
-    } else {
-        this.peerconnection.createAnswer(
-            _successCallback, _errorCallback, constraints);
-    }
-};
+    return new Promise((resolve, reject) => {
+        let oaPromise;
 
-/* eslint-enable max-params */
+        if (isOffer) {
+            oaPromise = this.peerconnection.createOffer(constraints);
+        } else {
+            oaPromise = this.peerconnection.createAnswer(constraints);
+        }
+
+        oaPromise
+            .then(
+                sdp => handleSuccess(sdp, resolve, reject),
+                error => handleFailure(error, reject));
+    });
+};
 
 /**
  * Extract primary SSRC from given {@link TrackSSRCInfo} object.
@@ -2278,7 +2359,7 @@ function extractPrimarySSRC(ssrcObj) {
  */
 TraceablePeerConnection.prototype._processLocalSSRCsMap = function(ssrcMap) {
     for (const track of this.localTracks.values()) {
-        const trackMSID = track.getMSID();
+        const trackMSID = track.storedMSID;
 
         if (ssrcMap.has(trackMSID)) {
             const newSSRC = ssrcMap.get(trackMSID);
@@ -2304,6 +2385,9 @@ TraceablePeerConnection.prototype._processLocalSSRCsMap = function(ssrcMap) {
                         } with: `, newSSRC);
                 }
                 this.localSSRCs.set(track.rtcId, newSSRC);
+
+                this.eventEmitter.emit(
+                    RTCEvents.LOCAL_TRACK_SSRC_UPDATED, track, newSSRCNum);
             } else {
                 logger.debug(
                     `The local SSRC(${newSSRCNum}) for ${track} ${trackMSID}`
@@ -2315,27 +2399,15 @@ TraceablePeerConnection.prototype._processLocalSSRCsMap = function(ssrcMap) {
     }
 };
 
-TraceablePeerConnection.prototype.addIceCandidate = function(
-        candidate,
-        successCallback,
-        failureCallback) {
-    // var self = this;
-    this.trace('addIceCandidate', JSON.stringify(candidate, null, ' '));
-    this.peerconnection.addIceCandidate(
-        candidate, successCallback, failureCallback);
+TraceablePeerConnection.prototype.addIceCandidate = function(candidate) {
+    this.trace('addIceCandidate', JSON.stringify({
+        candidate: candidate.candidate,
+        sdpMid: candidate.sdpMid,
+        sdpMLineIndex: candidate.sdpMLineIndex,
+        usernameFragment: candidate.usernameFragment
+    }, null, ' '));
 
-    /* maybe later
-     this.peerconnection.addIceCandidate(candidate,
-     function () {
-     self.trace('addIceCandidateOnSuccess');
-     successCallback();
-     },
-     function (err) {
-     self.trace('addIceCandidateOnFailure', err);
-     failureCallback(err);
-     }
-     );
-     */
+    return this.peerconnection.addIceCandidate(candidate);
 };
 
 /**
@@ -2348,25 +2420,19 @@ TraceablePeerConnection.prototype.addIceCandidate = function(
  * @returns {void}
  */
 TraceablePeerConnection.prototype.getStats = function(callback, errback) {
-    // TODO: Is this the correct way to handle Opera, Temasys?
     // TODO (brian): After moving all browsers to adapter, check if adapter is
     // accounting for different getStats apis, making the browser-checking-if
     // unnecessary.
-    if (RTCBrowserType.isFirefox()
-            || RTCBrowserType.isTemasysPluginUsed()
-            || RTCBrowserType.isReactNative()) {
-        this.peerconnection.getStats(
-            null,
-            callback,
-            errback || (() => {
+    if (browser.isSafariWithWebrtc() || browser.isFirefox()
+            || browser.isReactNative()) {
+        // uses the new Promise based getStats
+        this.peerconnection.getStats()
+            .then(callback)
+            .catch(errback || (() => {
 
                 // Making sure that getStats won't fail if error callback is
                 // not passed.
             }));
-    } else if (RTCBrowserType.isSafariWithWebrtc()) {
-        // FIXME: Safari's native stats implementation is not compatibile with
-        // existing stats processing logic. Skip implementing stats for now to
-        // at least get native webrtc Safari available for use.
     } else {
         this.peerconnection.getStats(callback);
     }
@@ -2404,7 +2470,7 @@ TraceablePeerConnection.prototype.generateNewStreamSSRCInfo = function(track) {
             groups: []
         };
     }
-    if (!this.options.disableRtx && RTCBrowserType.supportsRtx()) {
+    if (!this.options.disableRtx && browser.supportsRtx()) {
         // Specifically use a for loop here because we'll
         //  be adding to the list we're iterating over, so we
         //  only want to iterate through the items originally
@@ -2426,6 +2492,54 @@ TraceablePeerConnection.prototype.generateNewStreamSSRCInfo = function(track) {
     this.localSSRCs.set(rtcId, ssrcInfo);
 
     return ssrcInfo;
+};
+
+const handleLayerSuspension = function(peerConnection, isSelected) {
+    const videoSender = peerConnection.getSenders()
+        .find(sender => sender.track.kind === 'video');
+
+    if (!videoSender) {
+        logger.warn('handleLayerSuspension unable to find video sender');
+
+        return;
+    }
+    if (!videoSender.getParameters) {
+        logger.debug('Browser doesn\'t support RTPSender parameters');
+
+        return;
+    }
+    const parameters = videoSender.getParameters();
+
+    if (isSelected) {
+        logger.debug('Currently selected, enabling all sim layers');
+
+        // Make sure all encodings are enabled
+        parameters.encodings.forEach(e => {
+            e.active = true;
+        });
+    } else {
+        logger.debug('Not currently selected, disabling upper layers');
+
+        // Turn off the upper simulcast layers
+        [ 1, 2 ].forEach(simIndex => {
+            if (parameters.encodings[simIndex]) {
+                parameters.encodings[simIndex].active = false;
+            }
+        });
+    }
+    videoSender.setParameters(parameters);
+};
+
+/**
+ * Set whether or not the endpoint is 'selected' by other endpoints, meaning
+ * it appears on their main stage
+ */
+TraceablePeerConnection.prototype.setIsSelected = function(isSelected) {
+    if (this.options.enableLayerSuspension) {
+        logger.debug('Layer suspension enabled,'
+            + `currently selected? ${isSelected}`);
+        handleLayerSuspension(this.peerconnection, isSelected);
+    }
 };
 
 /**
