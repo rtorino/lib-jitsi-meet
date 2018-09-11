@@ -893,7 +893,7 @@ class RTCUtils extends Listenable {
                     }
                 });
 
-                if (browser.supportsDeviceChangeEvent()) {
+                if (navigator.mediaDevices.addEventListener && browser.supportsDeviceChangeEvent()) {
                     navigator.mediaDevices.addEventListener(
                         'devicechange',
                         updateKnownDevices);
